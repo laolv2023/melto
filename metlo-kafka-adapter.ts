@@ -277,7 +277,57 @@ function buildSessionMeta(
 }
 
 // ============================================================================
-// §4 核心适配函数
+// §4 敏感数据脱敏 — 防止 Token 明文落库
+// ============================================================================
+
+/**
+ * 需要脱敏的 Header 名称 (小写匹配)
+ *
+ * Cookie / Set-Cookie: 包含 JWT token、session ID
+ * Authorization:      包含 Bearer token 或 Basic auth 凭证
+ * X-API-Key:          自定义 API key
+ */
+const SENSITIVE_HEADERS = [
+  "cookie",
+  "set-cookie",
+  "authorization",
+  "x-api-key",
+  "x-auth-token",
+  "proxy-authorization",
+];
+
+/** 脱敏占位符 */
+const REDACTED_VALUE = "[REDACTED]";
+
+/**
+ * 判断单个 header 是否需要脱敏
+ */
+function isSensitive(name: string): boolean {
+  return SENSITIVE_HEADERS.includes(name.toLowerCase());
+}
+
+/**
+ * 对 headers 数组中的敏感 header 进行脱敏
+ *
+ * 保留 header name 不变 (端点发现需要识别 auth 类型),
+ * 仅替换 value 为 [REDACTED]。
+ *
+ * @returns [sanitized, wasRedacted] — 脱敏后的数组 + 是否实际有脱敏
+ */
+function sanitizeHeaders(headers: PairObject[]): [PairObject[], boolean] {
+  let wasRedacted = false;
+  const sanitized = headers.map((h) => {
+    if (isSensitive(h.name)) {
+      wasRedacted = true;
+      return { name: h.name, value: REDACTED_VALUE };
+    }
+    return h;
+  });
+  return [sanitized, wasRedacted];
+}
+
+// ============================================================================
+// §5 核心适配函数
 // ============================================================================
 
 /**
@@ -330,8 +380,12 @@ function adapt(raw: RawMirrorLog): QueuedApiTraceV1 {
     destinationPort: port,
   };
 
-  // ── 组装 SessionMeta ──
+  // ── 组装 SessionMeta (必须在脱敏前调用 — 需要 Cookie 原文) ──
   const sessionMeta = buildSessionMeta(requestHeaders);
+
+  // ── 脱敏 (在 SessionMeta 提取之后 — Cookie 原文已提取用户身份) ──
+  const [finalRequestHeaders, reqRedacted] = sanitizeHeaders(requestHeaders);
+  const [finalResponseHeaders, resRedacted] = sanitizeHeaders(responseHeaders);
 
   // ── 输出 ──
   return {
@@ -340,17 +394,17 @@ function adapt(raw: RawMirrorLog): QueuedApiTraceV1 {
     host,
     method: raw.method as RestMethod,
     requestParameters,
-    requestHeaders,
+    requestHeaders: finalRequestHeaders,
     requestBody: raw.requestPayload || "",
     responseStatus: parseStatusCode(raw.statusCode),
-    responseHeaders,
+    responseHeaders: finalResponseHeaders,
     responseBody: raw.responsePayload || "",
     meta,
     sessionMeta,
+    redacted: reqRedacted || resRedacted,   // 任一 header 被脱敏则标记
     // V1 不携带以下字段
     processedTraceData: undefined,
     endpointPath: undefined,
-    redacted: undefined,
     analysisType: undefined,
     graphqlPaths: undefined,
     originalHost: undefined,
@@ -359,7 +413,7 @@ function adapt(raw: RawMirrorLog): QueuedApiTraceV1 {
 }
 
 // ============================================================================
-// §5 批量适配 + 错误处理
+// §6 批量适配 + 错误处理
 // ============================================================================
 
 /** 适配错误 */
@@ -397,7 +451,7 @@ function adaptBatch(raws: RawMirrorLog[]): {
 }
 
 // ============================================================================
-// §6 Kafka Producer 集成
+// §7 Kafka Producer 集成
 // ============================================================================
 
 import type { MetloContext } from "./metlo-kafka-data-model";
@@ -451,7 +505,7 @@ async function adaptAndProduce(
 }
 
 // ============================================================================
-// §7 字段映射速查表
+// §8 字段映射速查表
 // ============================================================================
 
 /*
@@ -480,7 +534,7 @@ async function adaptAndProduce(
  */
 
 // ============================================================================
-// §8 导出
+// §9 导出
 // ============================================================================
 
 export {
@@ -499,7 +553,11 @@ export {
   extractCookie,
   getCookieValue,
 
-  // 适配器
+  // 脱敏
+  sanitizeHeaders,
+  isSensitive,
+  SENSITIVE_HEADERS,
+  REDACTED_VALUE,
   adapt,
   adaptBatch,
   adaptAndProduce,
