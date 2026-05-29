@@ -1,0 +1,99 @@
+{
+  "metlo.alerts": {
+    "meta": {
+      "messageId": "6104c6a3-51e5-444a-90c3-62141ebf86e0",
+      "timestamp": "2026-05-29T04:57:40.048307+00:00",
+      "eventType": "alert_created"
+    },
+    "alert": {
+      "uuid": "632bd62d-604a-445e-8bdd-6d0910044b1a",
+      "type": "New Endpoint Detected",
+      "riskScore": "low",
+      "apiEndpointUuid": "844e6fe3-d2d0-4b05-a726-d8f9c7753d86",
+      "description": "New endpoint discovered: POST /api/threat_detection/save_api_distribution_data on 192.168.106.50:9091",
+      "status": "Open",
+      "createdAt": "2026-05-27T07:56:49+00:00",
+      "updatedAt": "2026-05-27T07:56:49+00:00"
+    },
+    "context": {
+      "endpoint": {
+        "path": "/api/threat_detection/save_api_distribution_data",
+        "method": "POST",
+        "host": "192.168.106.50:9091",
+        "riskScore": "low"
+      },
+      "dataFields": [],
+      "traceSummary": null
+    }
+  },
+  "metlo.endpoints": {
+    "meta": {
+      "messageId": "7f8e35a2-8670-4152-b56c-c9d22d384aa0",
+      "timestamp": "2026-05-29T04:57:40.048203+00:00",
+      "eventType": "endpoint_discovered"
+    },
+    "endpoint": {
+      "uuid": "844e6fe3-d2d0-4b05-a726-d8f9c7753d86",
+      "path": "/api/threat_detection/save_api_distribution_data",
+      "method": "POST",
+      "host": "192.168.106.50:9091",
+      "numberParams": 0,
+      "riskScore": "low",
+      "isGraphQl": false,
+      "isAuthenticated": true,
+      "isSensitive": false,
+      "firstDetected": "2026-05-27T07:56:49+00:00",
+      "lastActive": "2026-05-27T07:56:49+00:00",
+      "createdAt": "2026-05-27T07:56:49+00:00"
+    }
+  },
+  "metlo.datafields": {
+    "meta": {
+      "messageId": "701d05ef-cabb-4e8e-9e88-b335fdc3ebc7",
+      "timestamp": "2026-05-29T04:57:40.048283+00:00",
+      "eventType": "datafield_detected"
+    },
+    "dataField": {
+      "uuid": "491ffcc8-3e42-4120-b823-a448e09e5c84",
+      "dataPath": "(root)",
+      "dataSection": "reqBody",
+      "dataClasses": [
+        "Phone Number"
+      ],
+      "falsePositives": [],
+      "scannerIdentified": [],
+      "dataType": "string",
+      "apiEndpointUuid": "844e6fe3-d2d0-4b05-a726-d8f9c7753d86",
+      "dataTag": null,
+      "createdAt": "2026-05-27T07:56:49+00:00",
+      "updatedAt": "2026-05-27T07:56:49+00:00"
+    },
+    "endpointSummary": {
+      "path": "/api/threat_detection/save_api_distribution_data",
+      "method": "POST",
+      "host": "192.168.106.50:9091",
+      "riskScore": "low"
+    }
+  },
+  "metlo.spec.diffs": {
+    "meta": {
+      "messageId": "bc6e20e7-85d3-4a39-a9ab-04ce3f7b7392",
+      "timestamp": "2026-05-29T04:57:40.048344+00:00",
+      "eventType": "spec_diff_detected"
+    },
+    "diff": {
+      "apiEndpointUuid": "844e6fe3-d2d0-4b05-a726-d8f9c7753d86",
+      "specId": "spec-0c4c031c",
+      "diffType": "unexpected_status_code",
+      "detail": "HTTP 401 on POST /api/threat_detection/save_api_distribution_data",
+      "observedValue": "401",
+      "expectedValue": "200",
+      "createdAt": "2026-05-29T04:57:40.048347+00:00"
+    },
+    "endpointSummary": {
+      "path": "/api/threat_detection/save_api_distribution_data",
+      "method": "POST",
+      "host": "192.168.106.50:9091"
+    }
+  }
+}
