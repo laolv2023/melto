@@ -1,10 +1,10 @@
 # Metlo 消息队列 Kafka 化设计文档
 
-> 版本: v2.0  
-> 日期: 2026-05-28  
+> 版本: v2.1  
+> 日期: 2026-05-29  
 > 作者: 架构组  
 > 状态: 方案评审  
-> 变更: v1.0(v2) → v2.0 合并第三方 Topic 数据模型分析 + Zread 产品视角
+> 变更: v2.0 → v2.1 审核修正（Consumer 背压/offset 提交/降级格式/Docker 生产配置）
 
 ---
 
@@ -367,6 +367,16 @@ const consumer = kafka.consumer({
 #### 双 Topic 订阅 + 分流消费
 
 ```typescript
+// 启动时校验 License，作为进程级常量（不从 Kafka 消息中获取）
+const hasValidEnterpriseLicense = await validateLicense(process.env.LICENSE_KEY)
+
+// ignoredDetections 从 MetloConfig 缓存读取（PostgreSQL + Redis），
+// 每次 analyze 调用时获取最新值，同样不在消息体中
+const getIgnoredDetections = async (ctx: MetloContext): Promise<IgnoredDetection[]> => {
+  const config = await getMetloConfigCached(ctx)
+  return config?.ignoredDetections || []
+}
+
 async function startAnalyzerConsumer(): Promise<void> {
   await consumer.connect()
   // 同时订阅两个 topic
@@ -382,61 +392,93 @@ async function startAnalyzerConsumer(): Promise<void> {
 
   let paused = false
 
+  // 全局背压：暂停/恢复所有 topic 的所有分区
+  const pauseAll = () => {
+    if (!paused) {
+      consumer.pause([{ topic: FULL_TOPIC }, { topic: PARTIAL_TOPIC }])
+      paused = true
+    }
+  }
+  const resumeAll = () => {
+    if (paused) {
+      consumer.resume([{ topic: FULL_TOPIC }, { topic: PARTIAL_TOPIC }])
+      paused = false
+    }
+  }
+
   await consumer.run({
     autoCommit: false,
     eachBatchAutoResolve: false,
 
     eachBatch: async ({
-      batch, resolveOffset, heartbeat,
-      pause: pauseConsumer, commitOffsetsIfNecessary,
+      batch, resolveOffset, heartbeat, commitOffsetsIfNecessary,
     }) => {
-      for (const message of batch.messages) {
-        if (pool.queueSize >= 4096 && !paused) {
-          pauseConsumer()
-          paused = true
-        }
+      // 背压检查（batch 处理前）
+      if (pool.queueSize >= 4096) pauseAll()
 
+      const promises: Promise<void>[] = []
+
+      for (const message of batch.messages) {
         const raw = JSON.parse(message.value.toString())
 
         // ─── 分流逻辑（对应原始 analyzer.ts#L322-L340） ───
         if (raw.trace) {
           // FULL: 单条 trace
-          pool.run({
-            trace: raw.trace,
-            ctx: raw.ctx,
-            version: raw.version,
-            hasValidEnterpriseLicense,
-          })
-        } else if (raw.traces) {
-          // PARTIAL: 批量 traces
-          for (const t of raw.traces) {
+          promises.push(
             pool.run({
-              trace: t,
+              trace: raw.trace,
               ctx: raw.ctx,
               version: raw.version,
               hasValidEnterpriseLicense,
-            })
+              ignoredDetections: await getIgnoredDetections(raw.ctx),
+            }).then(() => resolveOffset(message.offset))
+              .catch((err) => {
+                mlog.withErr(err).error(`Analysis failed, offset: ${message.offset}`)
+                resolveOffset(message.offset) // 不阻塞后续消费
+              })
+          )
+        } else if (raw.traces) {
+          // PARTIAL: 批量 traces
+          for (const t of raw.traces) {
+            promises.push(
+              pool.run({
+                trace: t,
+                ctx: raw.ctx,
+                version: raw.version,
+                hasValidEnterpriseLicense,
+                ignoredDetections: await getIgnoredDetections(raw.ctx),
+              }).then(() => resolveOffset(message.offset))
+                .catch((err) => {
+                  mlog.withErr(err).error(`Analysis failed (partial), offset: ${message.offset}`)
+                  resolveOffset(message.offset)
+                })
+            )
           }
+        } else {
+          // 未知消息格式，跳过
+          mlog.warn(`Unknown message format at offset: ${message.offset}`)
+          resolveOffset(message.offset)
         }
-
-        resolveOffset(message.offset)
       }
 
-      // 等待 Piscina 消化
-      while (pool.queueSize > 0) {
-        await sleep(100)
-        await heartbeat()
-      }
+      // 等待本 batch 所有分析完成后再提交
+      await Promise.all(promises)
 
-      if (paused && pool.queueSize < 1024) {
-        paused = false
-      }
+      // 背压恢复检查
+      if (paused && pool.queueSize < 1024) resumeAll()
 
+      await heartbeat()
       await commitOffsetsIfNecessary()
     },
   })
 }
 ```
+
+> **关键设计说明**：
+>
+> 1. **背压全局暂停**：`consumer.pause([{ topic }, { topic }])` 暂停所有 topic 的全部分区，而非 `eachBatch` 回调中的局部 `pause()`（仅暂停当前分区）。
+> 2. **await pool.run()**：每条消息必须等待分析完成后才 `resolveOffset`，保证 at-least-once 语义。使用 `Promise.all` 并行等待整个 batch，兼顾吞吐和正确性。
+> 3. **运行时参数**：`hasValidEnterpriseLicense` 和 `ignoredDetections` 是进程级/配置级常量，不从 Kafka 消息中获取，避免消息篡改风险。
 
 ### 4.5 `ctx` 扩展建议（Zread 视角）
 
@@ -976,29 +1018,82 @@ kafka-topics --bootstrap-server kafka:9092 \
 ### 10.2 Kafka 不可用降级
 
 ```typescript
+interface BufferedMessage {
+  topic: string
+  key: string
+  value: string               // 已序列化的完整消息（包含 ctx, version, trace/traces）
+}
+
 class TracePublisher {
-  private buffer: QueuedApiTrace[] = []
+  private buffer: BufferedMessage[] = []
   private readonly MAX_BUFFER = 10000
 
-  async publish(trace: QueuedApiTrace, analysisType: AnalysisType): Promise<void> {
+  // FULL 单条
+  async publishFull(trace: QueuedApiTrace, version: number): Promise<void> {
+    const msg: BufferedMessage = {
+      topic: FULL_TOPIC,
+      key: trace.host,
+      value: JSON.stringify({ ctx: {}, version, trace }),
+    }
+    await this.sendOrBuffer(msg)
+  }
+
+  // PARTIAL 批量
+  async publishPartial(traces: QueuedApiTraceV2[]): Promise<void> {
+    const key = traces[0]?.host || "unknown"
+    const msg: BufferedMessage = {
+      topic: PARTIAL_TOPIC,
+      key,
+      value: JSON.stringify({ ctx: {}, version: 2, traces }),
+    }
+    await this.sendOrBuffer(msg)
+  }
+
+  private async sendOrBuffer(msg: BufferedMessage): Promise<void> {
     try {
-      const topic = analysisType === AnalysisType.PARTIAL ? PARTIAL_TOPIC : FULL_TOPIC
       await producer.send({
-        topic,
-        messages: [{ key: trace.host, value: JSON.stringify({ ctx: {}, version: 2, trace }) }],
+        topic: msg.topic,
+        messages: [{ key: msg.key, value: msg.value }],
       })
+      // 发送成功后尝试刷盘历史 buffer
       await this.flushBuffer()
     } catch (err) {
-      mlog.withErr(err).warn("Kafka unavailable, buffering trace")
+      mlog.withErr(err).warn("Kafka unavailable, buffering message")
       if (this.buffer.length < this.MAX_BUFFER) {
-        this.buffer.push(trace)
+        this.buffer.push(msg)
       } else {
-        mlog.error("Buffer overflow, dropping trace")
+        mlog.error("Buffer overflow, dropping message")
+      }
+    }
+  }
+
+  private async flushBuffer(): Promise<void> {
+    while (this.buffer.length > 0) {
+      const batch = this.buffer.splice(0, 100)
+      try {
+        // 按 topic 分组批量发送
+        const byTopic = groupBy(batch, "topic")
+        for (const [topic, msgs] of Object.entries(byTopic)) {
+          await producer.send({
+            topic,
+            messages: msgs.map(m => ({ key: m.key, value: m.value })),
+          })
+        }
+      } catch (err) {
+        // 刷盘失败，放回 buffer 头部
+        this.buffer.unshift(...batch)
+        break
       }
     }
   }
 }
 ```
+
+> **关键设计说明**：
+>
+> 1. **序列化前置**：消息在入 buffer 前已完成 JSON 序列化（包含正确的 `{ trace }` 或 `{ traces }` 格式），恢复刷盘时直接发送，无需重新判断消息类型。
+> 2. **双方法分离**：`publishFull` / `publishPartial` 与 §4.2 Producer 设计的双 Topic 路由保持一致，避免格式混用。
+> 3. **按 topic 分组刷盘**：`flushBuffer` 将 buffer 按 topic 分组后批量发送，减少网络开销。
 
 ### 10.3 测试策略
 
@@ -1023,6 +1118,9 @@ class TracePublisher {
 ### B. Docker Compose 补充
 
 ```yaml
+# ============================================
+# 开发环境（单 Broker，内外网合一）
+# ============================================
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     environment:
@@ -1036,10 +1134,39 @@ class TracePublisher {
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # 单 listener：Docker 内网 service 名直接可达
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+# ============================================
+# 生产环境（双 listener：内外网分离）
+# Producer(Ingestor) 和 Consumer(Analyzer) 可能
+# 不在同一 Docker 网络，需暴露外部地址
+# ============================================
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on: [zookeeper]
+    ports:
+      - "9092:9092"        # 内网：Docker service 名访问
+      - "9093:9093"        # 外网：宿主机 IP 或 LB 访问
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # 双 listener 协议映射
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://<宿主机IP或域名>:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+
+# Ingestor 和 Analyzer 环境变量中 KAFKA_BROKERS 按角色使用不同地址：
+# - Docker 网络内（Analyzer）: KAFKA_BROKERS=kafka:9092
+# - Docker 网络外（Ingestor）: KAFKA_BROKERS=<宿主机IP>:9093
 ```
 
 ### C. 改造代码量预估
@@ -1063,3 +1190,11 @@ class TracePublisher {
 | 第三方 topic.txt | V1/V2 精确类型差异、FULL/PARTIAL 分流依据、源码行号 |
 | GitHub API 源码逆向 | 消费逻辑、Scanner 引擎、告警系统、Piscina 并发模型 |
 | Starlog 评测 | 竞品对比、开源局限性、适用场景判断 |
+
+### E. 变更历史
+
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| v1.0 | 2026-05-28 | 初版 — 单 Topic 方案、基础数据模型、工程落地章节 |
+| v2.0 | 2026-05-28 | 合并第三方 `topic.txt` + Zread — 双 Topic、V1/V2 精确类型、GraphQL 前移 |
+| v2.1 | 2026-05-29 | 审核修正 6 项：<br>1. **背压 Bug**: `pauseConsumer()` → `consumer.pause([{topic}, {topic}])` 全局暂停<br>2. **offset Bug**: `pool.run()` 未 await → `Promise.all` 等待完成后再提交<br>3. **降级格式不一致**: `TracePublisher` 单方法 → `publishFull`/`publishPartial` 双方法<br>4. **运行时参数来源**: 补充 `hasValidEnterpriseLicense`、`ignoredDetections` 获取说明<br>5. **Consumer 守卫**: 新增未知消息格式的 skip 分支<br>6. **Docker Compose**: 新增生产双 listener 配置
