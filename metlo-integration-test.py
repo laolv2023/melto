@@ -18,6 +18,7 @@ Metlo Kafka 适配层集成测试
 
 import json
 import re
+import os
 import time as time_module
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -137,7 +138,7 @@ def build_session_meta(headers: list[dict]) -> dict:
         except json.JSONDecodeError:
             pass
 
-    auth_type = "basic"
+    auth_type = None
     if auth_header:
         val = auth_header["value"].lower()
         if val.startswith("bearer "):
@@ -149,10 +150,11 @@ def build_session_meta(headers: list[dict]) -> dict:
     elif has_token:
         auth_type = "session_cookie"
 
+    auth_provided = bool(auth_header or has_token or user)
     return {
-        "authenticationProvided": bool(auth_header or has_token or user),
-        "authenticationSuccessful": bool(user or login_type == "ADMIN"),
-        "authType": auth_type,
+        "authenticationProvided": auth_provided,
+        "authenticationSuccessful": auth_provided and bool(user or login_type == "ADMIN"),
+        "authType": auth_type or "none",
         "uniqueSessionKey": user,
         "user": user,
     }
@@ -171,7 +173,8 @@ def adapt(raw: dict) -> dict:
             protocol = h["value"].upper()
             break
     if not any(h["name"].lower() == "x-forwarded-proto" for h in request_headers):
-        if ":443" in host:
+        m = re.search(r":(\d+)$", host)
+        if m and m.group(1) == "443":
             protocol = "HTTPS"
 
     port = extract_port(host, protocol)
@@ -212,7 +215,7 @@ def adapt(raw: dict) -> dict:
         "meta": {
             "incoming": raw.get("direction", "REQUEST") == "REQUEST",
             "source": raw.get("ip", ""),
-            "sourcePort": port,
+            "sourcePort": "0",
             "destination": raw.get("destIp", ""),
             "destinationPort": port,
         },
@@ -280,14 +283,16 @@ def scan_body(body_str: str) -> dict[str, list[str]]:
     return dict(findings)
 
 def generate_alerts(trace: dict, endpoint: str) -> list[dict]:
-    """模拟 Analyzer 告警生成逻辑"""
+    """模拟 Analyzer 告警生成逻辑
+    注意: endpoint 已包含 method (如 \"POST /api/xxx\"), 不再拼接 trace['method']
+    """
     alerts = []
 
     # 新端点告警
     alerts.append({
         "type": "New Endpoint Detected",
         "riskScore": "low",
-        "description": f"New endpoint discovered: {trace['method']} {endpoint}",
+        "description": f"New endpoint discovered: {endpoint}",
     })
 
     # 扫描敏感数据
@@ -299,7 +304,7 @@ def generate_alerts(trace: dict, endpoint: str) -> list[dict]:
             alerts.append({
                 "type": "PII Data Detected",
                 "riskScore": "medium",
-                "description": f"Sensitive data ({cls}) detected in {location}",
+                "description": f"Sensitive data ({cls}) detected in {location} of {endpoint}",
             })
 
     # 认证相关告警
@@ -310,22 +315,22 @@ def generate_alerts(trace: dict, endpoint: str) -> list[dict]:
         alerts.append({
             "type": "Unauthenticated Endpoint returning Sensitive Data",
             "riskScore": "high",
-            "description": f"Unauthenticated endpoint returning PII: {trace['method']} {endpoint}",
+            "description": f"Unauthenticated endpoint {endpoint}{' returning sensitive data.' if (req_findings or res_findings) else '.'}",
         })
 
     if sm["authType"] == "basic" and sm["authenticationProvided"]:
         alerts.append({
             "type": "Basic Authentication Detected",
             "riskScore": "medium",
-            "description": f"Basic Auth on {trace['method']} {endpoint}",
+            "description": f"Basic Auth detected on {endpoint}",
         })
 
-    # OpenAPI 差分 (模拟)
+    # OpenAPI 差分 (401)
     if trace["responseStatus"] == 401 and "/api/" in trace["path"]:
         alerts.append({
             "type": "Open API Spec Diff",
             "riskScore": "low",
-            "description": f"401 on documented endpoint: {trace['method']} {endpoint}",
+            "description": f"HTTP 401 on documented endpoint: {endpoint}",
         })
 
     return alerts
@@ -341,7 +346,11 @@ def main():
 
     # ── 1. 加载数据 ──
     print("\n[1] 加载数据...")
-    raw_logs = load_kafka_dump("/sandbox/workspace/uploads/log.txt")
+    # 默认输入文件 (可替换为 sys.argv[1])
+    input_file = "/sandbox/workspace/uploads/log.txt"
+    if not os.path.exists(input_file):
+        input_file = os.path.join(os.path.dirname(__file__), "uploads", "log.txt")
+    raw_logs = load_kafka_dump(input_file)
     print(f"    从 Kafka dump 提取: {len(raw_logs)} 条日志")
 
     # ── 2. 适配 ──
@@ -416,10 +425,16 @@ def main():
     # ── 6. 告警生成 ──
     print("\n[6] 告警生成 (Alert Pipeline 模拟)...")
     all_alerts = []
+    seen_endpoints = set()
     for t in traces:
         param_path = parameterize_path(t["path"])
         ep = f"{t['method']} {param_path}"
         alerts = generate_alerts(t, ep)
+        # New Endpoint 去重: 每个端点仅生成一次
+        if ep not in seen_endpoints:
+            seen_endpoints.add(ep)
+        else:
+            alerts = [a for a in alerts if a["type"] != "New Endpoint Detected"]
         all_alerts.extend(alerts)
 
     alert_by_type = defaultdict(int)
@@ -460,7 +475,8 @@ def main():
                     auth_redacted += 1
     print(f"    Authorization headers 总数: {sum(1 for t in traces for h in t['requestHeaders'] if h['name'].lower()=='authorization')}")
     print(f"    其中已脱敏: {auth_redacted}")
-    assert auth_redacted > 0, "Authorization 未被脱敏!"
+    if not (auth_redacted > 0):
+        raise AssertionError("Authorization 未被脱敏!")
 
     # ── 9. 结果 ──
     print("\n" + "=" * 70)
