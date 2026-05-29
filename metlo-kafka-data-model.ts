@@ -38,6 +38,8 @@ export enum AnalysisType {
 
 /** 认证类型 */
 export enum AuthType {
+  /** 无认证信息 (适配层扩展, 原始枚举中不存在) */
+  NONE = "none",
   BASIC = "basic",
   HEADER = "header",
   JWT = "jwt",
@@ -187,8 +189,9 @@ export interface ProcessedTraceData {
   attackDetections?: Record<string, string[]>;
   /** XSS 检测命中 — key: 字段路径, value: 载荷类型 */
   xssDetected?: Record<string, string>;
-  /** SQL 注入检测命中 — key: 字段路径, value: [注入类型, 载荷] */
-  sqliDetected?: Record<string, [string, string]>;
+  /** SQL 注入检测命中 — key: 字段路径, value: [注入类型, 载荷]
+   *  注意: JSON 序列化后为 string[], 需 Consumer 端判长校验 */
+  sqliDetected?: Record<string, string[]>;
   /** 敏感数据检测命中 — key: 字段路径, value: [DataClass 枚举值] */
   sensitiveDataDetected: Record<string, string[]>;
   /** 字段数据类型推断 — key: 字段路径, value: [DataType 枚举值] */
@@ -250,7 +253,7 @@ export interface QueuedApiTraceV1 {
   // ── 以下字段 V1 不携带, 始终为 undefined ──
   processedTraceData?: undefined;
   endpointPath?: undefined;
-  redacted?: undefined;
+  redacted?: boolean;   // 脱敏标记 — V1 原本不携带, 适配层可注入
   analysisType?: undefined;
   graphqlPaths?: undefined;
   originalHost?: undefined;
@@ -313,7 +316,8 @@ export type QueuedApiTrace = QueuedApiTraceV1 | QueuedApiTraceV2;
 
 /**
  * 请求上下文。
- * 当前为空接口 {}。Kafka 场景下建议扩展 traceId/apiKeyId/ingestTimestamp。
+ * 带 Kafka 扩展建议 (traceId/apiKeyId/ingestTimestamp)。
+ * 无字段时序列化为 {}。
  * 来源: backend/src/types.ts#L3
  */
 export interface MetloContext {
