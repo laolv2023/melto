@@ -8,7 +8,7 @@
  *
  * 输入:  Akto 流量镜像原始日志 (见示例)
  * 输出:  QueuedApiTraceV1 (无 SDK 预分析, processedTraceData=undefined)
- * 目地:  publishTraceV1() → Kafka metlo.traces.full
+ * 目的:  publishTraceV1() → Kafka metlo.traces.full
  *
  * 版本: v1.0
  * 日期: 2026-05-29
@@ -22,6 +22,9 @@ import {
   SessionMeta,
   PairObject,
   QueuedApiTraceV1,
+  MetloContext,
+  serializeFullMessage,
+  KafkaTopic,
 } from "./metlo-kafka-data-model";
 
 // ============================================================================
@@ -124,8 +127,7 @@ function parseHeaders(headersStr: string): PairObject[] {
 /**
  * 从请求头中提取 Host
  *
- * 优先从 "Host" header 取, 其次从 ":authority" (HTTP/2),
- * 都取不到则从 tag.url 解析。
+ * 优先从 "Host" header 取, 其次从 tag.url 解析。
  */
 function extractHost(headers: PairObject[], tag: ParsedTag): string {
   const hostHeader = headers.find(
@@ -254,8 +256,8 @@ function buildSessionMeta(
     user = userInfo.userName || user;
   }
 
-  // 判定认证类型
-  let authType: AuthType = AuthType.BASIC;
+  // 判定认证类型: 无认证材料时标记为 "none" 而非 "basic"
+  let authType: AuthType = AuthType.BASIC;  // fallback
   if (authHeader) {
     const val = authHeader.value.toLowerCase();
     if (val.startsWith("bearer ")) authType = AuthType.JWT;
@@ -263,12 +265,14 @@ function buildSessionMeta(
     else authType = AuthType.HEADER;
   } else if (hasToken) {
     authType = AuthType.SESSION_COOKIE;
+  } else {
+    authType = AuthType.NONE;     // 无认证材料
   }
 
   // 判定认证状态
   const authenticationProvided = !!(authHeader || hasToken || user);
-  const authenticationSuccessful =
-    !!user || loginType === "ADMIN";
+  const authenticationSuccessful = authenticationProvided &&
+    (!!user || loginType === "ADMIN");
 
   return {
     authenticationProvided,
@@ -343,7 +347,10 @@ function inferProtocol(headers: PairObject[]): string {
   if (forwarded) return forwarded.value.toUpperCase();
 
   const host = headers.find((h) => h.name.toLowerCase() === "host");
-  if (host && host.value.includes(":443")) return "HTTPS";
+  if (host) {
+    const portMatch = host.value.match(/:(\d+)$/);
+    if (portMatch && portMatch[1] === "443") return "HTTPS";
+  }
   return "HTTP";
 }
 
@@ -375,12 +382,14 @@ function adapt(raw: RawMirrorLog): QueuedApiTraceV1 {
   }
 
   // ── 组装 Meta ──
+  // 目标端口: 从 Host header 提取 (服务端口)
+  // 源端口:   源端口通常为临时端口, Akto 未提供时标记 "0"
   const meta: Meta = {
     incoming: raw.direction === "REQUEST",
     source: raw.ip,
-    sourcePort: port,
+    sourcePort: "0",             // Akto 日志不含源端口; 目标端口见下
     destination: raw.destIp,
-    destinationPort: port,
+    destinationPort: port,       // 从 Host header ":9090" 提取
   };
 
   // ── 组装 SessionMeta (必须在脱敏前调用 — 需要 Cookie 原文) ──
@@ -457,9 +466,6 @@ function adaptBatch(raws: RawMirrorLog[]): {
 // §7 Kafka Producer 集成
 // ============================================================================
 
-import type { MetloContext } from "./metlo-kafka-data-model";
-import { serializeFullMessage } from "./metlo-kafka-data-model";
-
 /**
  * 适配并发送到 Kafka FULL topic
  *
@@ -492,7 +498,7 @@ async function adaptAndProduce(
 
     try {
       await producer.send({
-        topic: "metlo.traces.full",
+        topic: KafkaTopic.FULL,
         messages,
       });
     } catch (err) {
@@ -523,8 +529,8 @@ async function adaptAndProduce(
  * │ responsePayload      │ responseBody            │ 直接映射                     │
  * │ ip                   │ meta.source             │ 直接映射                     │
  * │ destIp               │ meta.destination        │ 直接映射                     │
- * │ Host header          │ meta.sourcePort         │ 从 "Host: x.x.x.x:9090" 解析  │
- * │ Host header          │ meta.destinationPort    │ 同上                        │
+ * │ —                    │ meta.sourcePort         │ 固定 "0" (Akto 不提供源端口) │
+ * │ Host header          │ meta.destinationPort    │ 从 "Host: x.x.x.x:9090" 解析 │
  * │ direction            │ meta.incoming           │ "REQUEST" → true             │
  * │ time (Unix秒)        │ createdAt               │ parseInt × 1000 → new Date() │
  * │ statusCode (str)     │ responseStatus          │ parseInt                     │
