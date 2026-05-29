@@ -98,7 +98,10 @@ const DEFAULT_HTTPS_PORT = "443";
 function safeJsonParse<T>(str: string, fallback: T): T {
   if (!str || str.trim() === "") return fallback;
   try {
-    return JSON.parse(str) as T;
+    const parsed = JSON.parse(str);
+    // 防御 JSON.parse("null") / "123" / "true" 等非对象值
+    if (parsed === null || typeof parsed !== "object") return fallback;
+    return parsed as T;
   } catch {
     return fallback;
   }
