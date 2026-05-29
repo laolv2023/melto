@@ -307,7 +307,7 @@ python3 metlo-integration-test.py
   → 适配 (69/69 成功)
   → 端点发现 (30 个唯一端点)
   → 敏感数据扫描 (64 次命中)
-  → 告警生成 (100 条)
+  → 告警生成 (137 条)
   → 输出 4 个 Kafka Topic (231 条消息)
 ```
 
@@ -316,7 +316,7 @@ python3 metlo-integration-test.py
 ```
 输入: 69 条 → 输出: 231 条 (4 Topic)
 适配: 69/69 (100%)
-告警: HIGH=6, MEDIUM=64, LOW=100
+告警: HIGH=6, MEDIUM=64, LOW=67
 脱敏: 38/38 Authorization → [REDACTED]
 数据质量: 全部通过
 ```
